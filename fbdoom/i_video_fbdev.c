@@ -47,6 +47,9 @@ rcsid[] = "$Id: i_x.c,v 1.6 1997/02/03 22:45:10 b1 Exp $";
 #include <sys/socket.h>
 #include <linux/fb.h>
 #include <sys/ioctl.h>
+#include <stdio.h>
+#include <sys/mman.h>
+#include <stdint.h>
 
 //#define CMAP256
 
@@ -67,6 +70,8 @@ static struct color colors[256];
 
 byte *I_VideoBuffer = NULL;
 byte *I_VideoBuffer_FB = NULL;
+byte *I_VideoBuffer_ROTATE = NULL;
+byte *I_VideoBuffer_NV12 = NULL;
 
 /* framebuffer file descriptor */
 int fd_fb = 0;
@@ -141,15 +146,15 @@ void cmap_to_fb(uint8_t * out, uint8_t * in, int in_pixels)
     for (i = 0; i < in_pixels; i++)
     {
         c = colors[*in];  /* R:8 G:8 B:8 format! */
-        r = (uint16_t)(c.r >> (8 - fb.red.length));
-        g = (uint16_t)(c.g >> (8 - fb.green.length));
-        b = (uint16_t)(c.b >> (8 - fb.blue.length));
-        pix = r << fb.red.offset;
-        pix |= g << fb.green.offset;
-        pix |= b << fb.blue.offset;
+        r = (uint16_t)(c.r >> (8 - 8));
+        g = (uint16_t)(c.g >> (8 - 8));
+        b = (uint16_t)(c.b >> (8 - 8));
+        pix = r << 0;
+        pix |= g << 8;
+        pix |= b << 16;
 
         for (k = 0; k < fb_scaling; k++) {
-            for (j = 0; j < fb.bits_per_pixel/8; j++) {
+            for (j = 0; j < 24/8; j++) {
                 *out = (pix >> (j*8));
                 out++;
             }
@@ -158,47 +163,73 @@ void cmap_to_fb(uint8_t * out, uint8_t * in, int in_pixels)
     }
 }
 
+void encodeYUV420SP(unsigned char * yuv420sp, unsigned char * argb, int width, int height)
+{
+    int frameSize = width * height;
+
+    int yIndex = 0;
+    int uvIndex = frameSize;
+
+    int index = 0;
+    int i, j;
+    for (j = 0; j < height; j++) {
+        for (i = 0; i < width; i++) {
+            int R = argb[(j * width + i) * 3 + 2];
+            int G = argb[(j * width + i) * 3 + 1];
+            int B = argb[(j * width + i) * 3 + 0];
+
+            // well known RGB to YUV algorithm
+            int Y = (( 66 * R + 129 * G +  25 * B + 128) >> 8) +  16;
+            int V = ((-38 * R -  74 * G + 112 * B + 128) >> 8) + 128;
+            int U = ((112 * R -  94 * G -  18 * B + 128) >> 8) + 128;
+
+            // NV21 has a plane of Y and interleaved planes of VU each sampled by a factor of 2
+            //    meaning for every 4 Y pixels there are 1 V and 1 U.  Note the sampling is every other
+            //    pixel AND every other scanline.
+            yuv420sp[yIndex++] = (unsigned char) ((Y < 0)? 0: ((Y > 255) ? 255 : Y));
+            if (j % 2 == 0 && index % 2 == 0) {
+                yuv420sp[uvIndex++] = (unsigned char) ((V < 0) ? 0 : ((V > 255) ? 255 : V));
+                yuv420sp[uvIndex++] = (unsigned char) ((U < 0) ? 0 : ((U > 255) ? 255 : U));
+            }
+
+            index ++;
+        }
+    }
+}
+
+off_t page_offset;
+uint8_t *mem;
+
 void I_InitGraphics (void)
 {
     int i;
 
-    /* Open fbdev file descriptor */
-    fd_fb = open("/dev/fb0", O_RDWR);
-    if (fd_fb < 0)
-    {
-        printf("Could not open /dev/fb0");
-        exit(-1);
-    }
-
-    /* fetch framebuffer info */
-    ioctl(fd_fb, FBIOGET_VSCREENINFO, &fb);
-    /* change params if needed */
-    //ioctl(fd_fb, FBIOPUT_VSCREENINFO, &fb);
-    printf("I_InitGraphics: framebuffer: x_res: %d, y_res: %d, x_virtual: %d, y_virtual: %d, bpp: %d, grayscale: %d\n",
-            fb.xres, fb.yres, fb.xres_virtual, fb.yres_virtual, fb.bits_per_pixel, fb.grayscale);
-
-    printf("I_InitGraphics: framebuffer: RGBA: %d%d%d%d, red_off: %d, green_off: %d, blue_off: %d, transp_off: %d\n",
-            fb.red.length, fb.green.length, fb.blue.length, fb.transp.length, fb.red.offset, fb.green.offset, fb.blue.offset, fb.transp.offset);
-
     printf("I_InitGraphics: DOOM screen size: w x h: %d x %d\n", SCREENWIDTH, SCREENHEIGHT);
-
-
-    i = M_CheckParmWithArgs("-scaling", 1);
-    if (i > 0) {
-        i = atoi(myargv[i + 1]);
-        fb_scaling = i;
-        printf("I_InitGraphics: Scaling factor: %d\n", fb_scaling);
-    } else {
-        fb_scaling = fb.xres / SCREENWIDTH;
-        if (fb.yres / SCREENHEIGHT < fb_scaling)
-            fb_scaling = fb.yres / SCREENHEIGHT;
-        printf("I_InitGraphics: Auto-scaling factor: %d\n", fb_scaling);
-    }
-
+    fb_scaling = 1;
 
     /* Allocate screen to draw to */
 	I_VideoBuffer = (byte*)Z_Malloc (SCREENWIDTH * SCREENHEIGHT, PU_STATIC, NULL);  // For DOOM to draw on
-	I_VideoBuffer_FB = (byte*)malloc(fb.xres * fb.yres * (fb.bits_per_pixel/8));     // For a single write() syscall to fbdev
+	I_VideoBuffer_FB = (byte*)malloc(320 * 200 * (24/8));     // For a single write() syscall to fbdev
+
+    I_VideoBuffer_ROTATE = (byte*)malloc(256 * 320 * (24/8)); // For RGB data, but rotated
+    I_VideoBuffer_NV12 = (byte*)malloc(256 * 320 * 3);        // For NV12 YUV data 
+
+    off_t offset = 0xb8100000;
+    offset = 0xb8100000;
+
+    size_t len = 320 * 256 * 3;
+
+    // Truncate offset to a multiple of the page size, or mmap will fail.
+    size_t pagesize = sysconf(_SC_PAGE_SIZE);
+    off_t page_base = (offset / pagesize) * pagesize;
+    page_offset = offset - page_base;
+
+    int fd = open("/dev/mem", O_RDWR | O_SYNC);
+    mem = mmap(NULL, page_offset + len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, page_base);
+    if (mem == MAP_FAILED) {
+        perror("Can't map memory");
+        return -1;
+    }
 
 	screenvisible = true;
 
@@ -410,10 +441,10 @@ void I_FinishUpdate (void)
     /* 600 = fb heigt, 200 screenheight */
     /* 600 = fb heigt, 200 screenheight */
     /* 2048 =fb width, 320 screenwidth */
-    y_offset     = (((fb.yres - (SCREENHEIGHT * fb_scaling)) * fb.bits_per_pixel/8)) / 2;
-    x_offset     = (((fb.xres - (SCREENWIDTH  * fb_scaling)) * fb.bits_per_pixel/8)) / 2; // XXX: siglent FB hack: /4 instead of /2, since it seems to handle the resolution in a funny way
+    y_offset     = (((200 - (SCREENHEIGHT * fb_scaling)) * 24/8)) / 2;
+    x_offset     = (((320 - (SCREENWIDTH  * fb_scaling)) * 24/8)) / 2; // XXX: siglent FB hack: /4 instead of /2, since it seems to handle the resolution in a funny way
     //x_offset     = 0;
-    x_offset_end = ((fb.xres - (SCREENWIDTH  * fb_scaling)) * fb.bits_per_pixel/8) - x_offset;
+    x_offset_end = ((320 - (SCREENWIDTH  * fb_scaling)) * 24/8) - x_offset;
 
     /* DRAW SCREEN */
     line_in  = (unsigned char *) I_VideoBuffer;
@@ -426,24 +457,24 @@ void I_FinishUpdate (void)
         int i;
         for (i = 0; i < fb_scaling; i++) {
             line_out += x_offset;
-#ifdef CMAP256
-            for (fb_scaling == 1) {
-                memcpy(line_out, line_in, SCREENWIDTH); /* fb_width is bigger than Doom SCREENWIDTH... */
-            } else {
-                //XXX FIXME fb_scaling support!
-            }
-#else
-            //cmap_to_rgb565((void*)line_out, (void*)line_in, SCREENWIDTH);
             cmap_to_fb((void*)line_out, (void*)line_in, SCREENWIDTH);
-#endif
-            line_out += (SCREENWIDTH * fb_scaling * (fb.bits_per_pixel/8)) + x_offset_end;
+            line_out += (SCREENWIDTH * fb_scaling * (24/8)) + x_offset_end;
         }
         line_in += SCREENWIDTH;
     }
 
-    /* Start drawing from y-offset */
-    lseek(fd_fb, y_offset * fb.xres, SEEK_SET);
-    write(fd_fb, I_VideoBuffer_FB, (SCREENHEIGHT * fb_scaling * (fb.bits_per_pixel/8)) * fb.xres); /* draw only portion used by doom + x-offsets */
+    // Rotate the image first into our RGB 256*320 buffer (leaving 16 pixels at the side border)
+    for (int y = 0; y < 200; ++y)
+    {
+        for (int x = 0; x < 320; ++x)
+        {
+            I_VideoBuffer_ROTATE[(((x * 256) + y + 20) * 3)] = I_VideoBuffer_FB[((((200 - y) * 320) + x) * 3)];
+            I_VideoBuffer_ROTATE[(((x * 256) + y + 20) * 3) + 1] = I_VideoBuffer_FB[((((200 - y) * 320) + x) * 3) + 1];
+            I_VideoBuffer_ROTATE[(((x * 256) + y + 20) * 3) + 2] = I_VideoBuffer_FB[((((200 - y) * 320) + x) * 3) + 2];
+        }
+    }
+    
+    encodeYUV420SP(mem + page_offset, I_VideoBuffer_ROTATE, 256, 320);
 }
 
 //
