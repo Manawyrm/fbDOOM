@@ -1,13 +1,9 @@
 ================
 = fbDOOM =
 ================
+Runs on Vevor SC240 thermal imaging cameras
 
-Adaptation of the original DOOM
-to be easily portable to framebuffer devices with minimal depenencies.
-Runs on:
-* Plain desktop Linux framebuffer,
-* Siglent SSA 3021X Spectrum Analyzer,
-* Frosted OS
+Check https://www.eevblog.com/forum/thermal-imaging/vevor-sc240n-topdon-tc004-infiray-c200-hisilicon-hi3516dv300/ for more info.
 
 To build (example):
 * cd fbdoom
